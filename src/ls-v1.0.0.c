@@ -1,8 +1,10 @@
 /*
-* Programming Assignment 02: ls v1.1.0
-* Feature: -l (long listing format)
+* Programming Assignment 02: ls v1.2.0
+* Features:
+*   v1.1.0: -l (long listing format)
+*   v1.2.0: default multi-column display, "down then across"
 * Usage:
-*       $ ls            -> simple listing of "."
+*       $ ls            -> column listing of "."
 *       $ ls -l         -> long listing of "."
 *       $ ls -l /etc /tmp
 */
@@ -18,6 +20,7 @@
 #include <grp.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
 
 extern int errno;
 
@@ -25,6 +28,7 @@ void do_ls(const char *dir);
 void do_ls_long(const char *dir);
 void mode_to_string(mode_t mode, char *str);
 int num_width(long long n);
+int get_term_width(void);
 
 int main(int argc, char *argv[])
 {
@@ -70,26 +74,96 @@ int main(int argc, char *argv[])
     return 0;
 }
 
-/* Original simple listing, unchanged from v1.0.0 */
+/* Ask the terminal how many columns wide it is.
+   Falls back to 80 if stdout is not a terminal (e.g. piped). */
+int get_term_width(void)
+{
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0)
+        return 80;
+    return ws.ws_col;
+}
+
+/* Default listing: multi-column, "down then across" */
 void do_ls(const char *dir)
 {
-    struct dirent *entry;
     DIR *dp = opendir(dir);
     if (dp == NULL)
     {
         fprintf(stderr, "Cannot open directory : %s\n", dir);
         return;
     }
+
+    char **names = NULL;      /* dynamic array of strings */
+    size_t count = 0;         /* how many names stored */
+    size_t capacity = 0;      /* how many slots allocated */
+    size_t maxlen = 0;        /* longest filename */
+    struct dirent *entry;
+
+    /* ---- Step 1: read all names into the array ---- */
     errno = 0;
     while ((entry = readdir(dp)) != NULL)
     {
         if (entry->d_name[0] == '.')
             continue;
-        printf("%s\n", entry->d_name);
+
+        if (count == capacity)  /* array full: double its size */
+        {
+            capacity = capacity ? capacity * 2 : 16;
+            char **tmp = realloc(names, capacity * sizeof(char *));
+            if (tmp == NULL)
+            {
+                perror("realloc");
+                break;
+            }
+            names = tmp;
+        }
+
+        names[count] = strdup(entry->d_name);  /* own copy of the name */
+        if (names[count] == NULL)
+        {
+            perror("strdup");
+            break;
+        }
+        size_t len = strlen(names[count]);
+        if (len > maxlen)
+            maxlen = len;
+        count++;
     }
     if (errno != 0)
         perror("readdir failed");
     closedir(dp);
+
+    /* ---- Step 2: work out the layout ---- */
+    if (count > 0)
+    {
+        size_t col_width = maxlen + 2;               /* name + 2 spaces */
+        size_t cols = (size_t)get_term_width() / col_width;
+        if (cols < 1) cols = 1;                      /* name wider than terminal */
+        if (cols > count) cols = count;
+        size_t rows = (count + cols - 1) / cols;     /* ceiling division */
+
+        /* ---- Step 3: print row by row ---- */
+        for (size_t r = 0; r < rows; r++)
+        {
+            for (size_t c = 0; c < cols; c++)
+            {
+                size_t idx = r + c * rows;           /* down-then-across index */
+                if (idx >= count)
+                    break;
+                if (idx + rows >= count)             /* last item in this row */
+                    printf("%s", names[idx]);
+                else
+                    printf("%-*s", (int)col_width, names[idx]);
+            }
+            putchar('\n');
+        }
+    }
+
+    /* ---- Step 4: free everything ---- */
+    for (size_t i = 0; i < count; i++)
+        free(names[i]);
+    free(names);
 }
 
 /* Number of digits needed to print n (used for column alignment) */
