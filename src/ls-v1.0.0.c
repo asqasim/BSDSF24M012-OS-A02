@@ -1,13 +1,14 @@
 /*
-* Programming Assignment 02: ls v1.3.0
+* Programming Assignment 02: ls v1.4.0
 * Features:
 *   v1.1.0: -l (long listing format)
 *   v1.2.0: default multi-column display, "down then across"
 *   v1.3.0: -x horizontal ("across") display
+*   v1.4.0: alphabetical sorting of all output
 * Usage:
-*       $ ls            -> column listing of "."
-*       $ ls -l         -> long listing
-*       $ ls -x         -> horizontal listing
+*       $ ls            -> sorted column listing of "."
+*       $ ls -l         -> sorted long listing
+*       $ ls -x         -> sorted horizontal listing
 *       $ ls -x /etc /tmp
 */
 #include <stdio.h>
@@ -37,6 +38,7 @@ extern int errno;
 void do_ls(const char *dir, display_mode_t mode);
 int read_entries(const char *dir, char ***names_out, size_t *count_out, size_t *maxlen_out);
 void free_entries(char **names, size_t count);
+int cmp_names(const void *a, const void *b);
 void print_vertical(char **names, size_t count, size_t maxlen);
 void print_horizontal(char **names, size_t count, size_t maxlen);
 void print_long(const char *dir, char **names, size_t count);
@@ -155,7 +157,18 @@ void free_entries(char **names, size_t count)
     free(names);
 }
 
-/* The main driver: read, then dispatch on the display mode */
+/* Comparison function for qsort.
+   qsort passes POINTERS TO ELEMENTS. Our elements are char*, so each
+   argument is really a char** (pointer to a char*). We cast, dereference
+   to get the string, then let strcmp decide the order. */
+int cmp_names(const void *a, const void *b)
+{
+    const char *s1 = *(const char * const *)a;
+    const char *s2 = *(const char * const *)b;
+    return strcmp(s1, s2);
+}
+
+/* The main driver: read, sort, then dispatch on the display mode */
 void do_ls(const char *dir, display_mode_t mode)
 {
     char **names = NULL;
@@ -163,6 +176,10 @@ void do_ls(const char *dir, display_mode_t mode)
 
     if (read_entries(dir, &names, &count, &maxlen) == -1)
         return;
+
+    /* Sort once, here, so every display mode gets sorted input */
+    if (count > 1)
+        qsort(names, count, sizeof(char *), cmp_names);
 
     switch (mode)
     {
@@ -273,7 +290,7 @@ void mode_to_string(mode_t mode, char *str)
         str[9] = (mode & S_IXOTH) ? 't' : 'T';
 }
 
-/* -l display: works from the already-read array of names */
+/* -l display: works from the already-read (and sorted) array of names */
 void print_long(const char *dir, char **names, size_t count)
 {
     struct stat st;
