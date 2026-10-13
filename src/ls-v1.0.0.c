@@ -1,15 +1,17 @@
 /*
-* Programming Assignment 02: ls v1.5.0
+* Programming Assignment 02: ls v1.6.0
 * Features:
 *   v1.1.0: -l (long listing format)
 *   v1.2.0: default multi-column display, "down then across"
 *   v1.3.0: -x horizontal ("across") display
 *   v1.4.0: alphabetical sorting of all output
 *   v1.5.0: colorized output based on file type
+*   v1.6.0: -R recursive listing
 * Usage:
 *       $ ls            -> sorted, colored column listing of "."
 *       $ ls -l         -> sorted, colored long listing
 *       $ ls -x         -> sorted, colored horizontal listing
+*       $ ls -R         -> recursive listing (combine with -l or -x)
 *       $ ls -x /etc /tmp
 */
 #include <stdio.h>
@@ -47,10 +49,14 @@ extern int errno;
 /* 1 if stdout is a terminal (colors on), 0 if piped/redirected (colors off) */
 int use_color = 0;
 
+/* 1 if -R was given: descend into subdirectories */
+int recursive_flag = 0;
+
 void do_ls(const char *dir, display_mode_t mode);
 int read_entries(const char *dir, char ***names_out, size_t *count_out, size_t *maxlen_out);
 void free_entries(char **names, size_t count);
 int cmp_names(const void *a, const void *b);
+int join_path(char *out, size_t size, const char *dir, const char *name);
 int has_suffix(const char *name, const char *suffix);
 const char *color_for(const char *name, mode_t mode);
 void print_colored(const char *name, mode_t mode);
@@ -71,9 +77,10 @@ int main(int argc, char *argv[])
        Otherwise "ls | cat" or "ls > file" would be full of escape codes. */
     use_color = isatty(STDOUT_FILENO);
 
-    /* "lx": both -l and -x are valid options without values.
-       If the user gives both, the last one wins. */
-    while ((opt = getopt(argc, argv, "lx")) != -1)
+    /* "lxR": all are valid options without values.
+       -l and -x choose the display mode (last one wins);
+       -R is independent and turns on recursion. */
+    while ((opt = getopt(argc, argv, "lxR")) != -1)
     {
         switch (opt)
         {
@@ -83,8 +90,11 @@ int main(int argc, char *argv[])
         case 'x':
             mode = MODE_HORIZONTAL;
             break;
+        case 'R':
+            recursive_flag = 1;
+            break;
         default: /* '?' = unknown option */
-            fprintf(stderr, "Usage: %s [-l | -x] [dir...]\n", argv[0]);
+            fprintf(stderr, "Usage: %s [-l | -x] [-R] [dir...]\n", argv[0]);
             return 1;
         }
     }
@@ -97,9 +107,19 @@ int main(int argc, char *argv[])
     {
         for (int i = optind; i < argc; i++)
         {
-            printf("Directory listing of %s : \n", argv[i]);
-            do_ls(argv[i], mode);
-            puts("");
+            if (recursive_flag)
+            {
+                /* do_ls prints the "dir:" header itself; just separate args */
+                if (i > optind)
+                    puts("");
+                do_ls(argv[i], mode);
+            }
+            else
+            {
+                printf("Directory listing of %s : \n", argv[i]);
+                do_ls(argv[i], mode);
+                puts("");
+            }
         }
     }
     return 0;
@@ -185,11 +205,31 @@ int cmp_names(const void *a, const void *b)
     return strcmp(s1, s2);
 }
 
-/* The main driver: read, sort, then dispatch on the display mode */
+/* Build "dir/name" into out. Avoids a double slash when dir already ends
+   in '/' (e.g. "src/" + "x" -> "src/x", not "src//x").
+   Returns 0 on success, -1 if the result would not fit. */
+int join_path(char *out, size_t size, const char *dir, const char *name)
+{
+    size_t dlen = strlen(dir);
+    int n;
+    if (dlen > 0 && dir[dlen - 1] == '/')
+        n = snprintf(out, size, "%s%s", dir, name);
+    else
+        n = snprintf(out, size, "%s/%s", dir, name);
+    if (n < 0 || (size_t)n >= size)
+        return -1;
+    return 0;
+}
+
+/* The main driver: read, sort, display, then (with -R) recurse */
 void do_ls(const char *dir, display_mode_t mode)
 {
     char **names = NULL;
     size_t count = 0, maxlen = 0;
+
+    /* -R: every directory is announced with a header, like real ls */
+    if (recursive_flag)
+        printf("%s:\n", dir);
 
     if (read_entries(dir, &names, &count, &maxlen) == -1)
         return;
@@ -208,6 +248,38 @@ void do_ls(const char *dir, display_mode_t mode)
     default:
         print_vertical(dir, names, count, maxlen);
         break;
+    }
+
+    /* Recursion: this directory is fully printed, now visit its subdirectories.
+       lstat (not stat) so a symlink to a directory is NOT followed; this
+       prevents infinite loops through symlink cycles.
+       Base case: a directory with no subdirectories -> the loop never calls
+       do_ls again, so the recursion unwinds. */
+    if (recursive_flag)
+    {
+        for (size_t i = 0; i < count; i++)
+        {
+            char path[PATH_MAX];
+            struct stat st;
+
+            if (strcmp(names[i], ".") == 0 || strcmp(names[i], "..") == 0)
+                continue;
+            if (join_path(path, sizeof(path), dir, names[i]) == -1)
+            {
+                fprintf(stderr, "Path too long : %s/%s\n", dir, names[i]);
+                continue;
+            }
+            if (lstat(path, &st) == -1)
+            {
+                perror(path);
+                continue;
+            }
+            if (S_ISDIR(st.st_mode))
+            {
+                putchar('\n');          /* blank line before next header */
+                do_ls(path, mode);      /* full path, not just the name */
+            }
+        }
     }
 
     free_entries(names, count);
