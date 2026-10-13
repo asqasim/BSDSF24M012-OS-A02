@@ -1,0 +1,5 @@
+Q1. stat() vs lstat()
+stat() follows symbolic links and returns information about the file the link points to. lstat() does not follow them and returns information about the link itself (its type is S_IFLNK, and its size is the length of the target path). For ls, lstat() is the right choice, because ls -l must show a symlink as a link (l in the type field, followed by name -> target). With stat(), every symlink would look like its target, and a broken link would cause an error.
+
+Q2. Using st_mode with bitwise operators
+st_mode packs the file type and the permissions into one integer. The type lives in the high bits (mask S_IFMT) and the permissions in the low 9 bits, with 3 more bits for setuid, setgid and sticky. To read a value, AND it with a mask. For example, (st_mode & S_IFMT) == S_IFDIR tests for a directory (the macro S_ISDIR(st_mode) does exactly this), and (st_mode & S_IRUSR) is non-zero if the owner has read permission. Each permission has its own constant (S_IRUSR, S_IWUSR, S_IXUSR, then the GRP and OTH versions). We test each of them to build the rwxr-xr-x string.
