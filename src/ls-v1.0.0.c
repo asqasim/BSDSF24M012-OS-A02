@@ -1,12 +1,14 @@
 /*
-* Programming Assignment 02: ls v1.2.0
+* Programming Assignment 02: ls v1.3.0
 * Features:
 *   v1.1.0: -l (long listing format)
 *   v1.2.0: default multi-column display, "down then across"
+*   v1.3.0: -x horizontal ("across") display
 * Usage:
 *       $ ls            -> column listing of "."
-*       $ ls -l         -> long listing of "."
-*       $ ls -l /etc /tmp
+*       $ ls -l         -> long listing
+*       $ ls -x         -> horizontal listing
+*       $ ls -x /etc /tmp
 */
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,10 +24,22 @@
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 
+/* Which display function should be used. Set once in main(). */
+typedef enum
+{
+    MODE_DEFAULT,     /* down then across */
+    MODE_LONG,        /* -l */
+    MODE_HORIZONTAL   /* -x */
+} display_mode_t;
+
 extern int errno;
 
-void do_ls(const char *dir);
-void do_ls_long(const char *dir);
+void do_ls(const char *dir, display_mode_t mode);
+int read_entries(const char *dir, char ***names_out, size_t *count_out, size_t *maxlen_out);
+void free_entries(char **names, size_t count);
+void print_vertical(char **names, size_t count, size_t maxlen);
+void print_horizontal(char **names, size_t count, size_t maxlen);
+void print_long(const char *dir, char **names, size_t count);
 void mode_to_string(mode_t mode, char *str);
 int num_width(long long n);
 int get_term_width(void);
@@ -33,41 +47,36 @@ int get_term_width(void);
 int main(int argc, char *argv[])
 {
     int opt;
-    int long_flag = 0;
+    display_mode_t mode = MODE_DEFAULT;
 
-    /* getopt scans argv for options. "l" means -l is a valid option
-       (with no value). It returns -1 when options are finished. */
-    while ((opt = getopt(argc, argv, "l")) != -1)
+    /* "lx": both -l and -x are valid options without values.
+       If the user gives both, the last one wins. */
+    while ((opt = getopt(argc, argv, "lx")) != -1)
     {
         switch (opt)
         {
         case 'l':
-            long_flag = 1;
+            mode = MODE_LONG;
+            break;
+        case 'x':
+            mode = MODE_HORIZONTAL;
             break;
         default: /* '?' = unknown option */
-            fprintf(stderr, "Usage: %s [-l] [dir...]\n", argv[0]);
+            fprintf(stderr, "Usage: %s [-l | -x] [dir...]\n", argv[0]);
             return 1;
         }
     }
 
-    /* After getopt, optind is the index of the first non-option
-       argument (the directory names). */
     if (optind == argc)
     {
-        if (long_flag)
-            do_ls_long(".");
-        else
-            do_ls(".");
+        do_ls(".", mode);
     }
     else
     {
         for (int i = optind; i < argc; i++)
         {
             printf("Directory listing of %s : \n", argv[i]);
-            if (long_flag)
-                do_ls_long(argv[i]);
-            else
-                do_ls(argv[i]);
+            do_ls(argv[i], mode);
             puts("");
         }
     }
@@ -84,23 +93,22 @@ int get_term_width(void)
     return ws.ws_col;
 }
 
-/* Default listing: multi-column, "down then across" */
-void do_ls(const char *dir)
+/* Read all non-hidden names of a directory into a dynamic array.
+   On success: *names_out = array, *count_out = how many, *maxlen_out = longest name.
+   Returns 0 on success, -1 if the directory cannot be opened. */
+int read_entries(const char *dir, char ***names_out, size_t *count_out, size_t *maxlen_out)
 {
     DIR *dp = opendir(dir);
     if (dp == NULL)
     {
         fprintf(stderr, "Cannot open directory : %s\n", dir);
-        return;
+        return -1;
     }
 
-    char **names = NULL;      /* dynamic array of strings */
-    size_t count = 0;         /* how many names stored */
-    size_t capacity = 0;      /* how many slots allocated */
-    size_t maxlen = 0;        /* longest filename */
+    char **names = NULL;
+    size_t count = 0, capacity = 0, maxlen = 0;
     struct dirent *entry;
 
-    /* ---- Step 1: read all names into the array ---- */
     errno = 0;
     while ((entry = readdir(dp)) != NULL)
     {
@@ -134,36 +142,94 @@ void do_ls(const char *dir)
         perror("readdir failed");
     closedir(dp);
 
-    /* ---- Step 2: work out the layout ---- */
-    if (count > 0)
-    {
-        size_t col_width = maxlen + 2;               /* name + 2 spaces */
-        size_t cols = (size_t)get_term_width() / col_width;
-        if (cols < 1) cols = 1;                      /* name wider than terminal */
-        if (cols > count) cols = count;
-        size_t rows = (count + cols - 1) / cols;     /* ceiling division */
+    *names_out = names;
+    *count_out = count;
+    *maxlen_out = maxlen;
+    return 0;
+}
 
-        /* ---- Step 3: print row by row ---- */
-        for (size_t r = 0; r < rows; r++)
-        {
-            for (size_t c = 0; c < cols; c++)
-            {
-                size_t idx = r + c * rows;           /* down-then-across index */
-                if (idx >= count)
-                    break;
-                if (idx + rows >= count)             /* last item in this row */
-                    printf("%s", names[idx]);
-                else
-                    printf("%-*s", (int)col_width, names[idx]);
-            }
-            putchar('\n');
-        }
-    }
-
-    /* ---- Step 4: free everything ---- */
+void free_entries(char **names, size_t count)
+{
     for (size_t i = 0; i < count; i++)
         free(names[i]);
     free(names);
+}
+
+/* The main driver: read, then dispatch on the display mode */
+void do_ls(const char *dir, display_mode_t mode)
+{
+    char **names = NULL;
+    size_t count = 0, maxlen = 0;
+
+    if (read_entries(dir, &names, &count, &maxlen) == -1)
+        return;
+
+    switch (mode)
+    {
+    case MODE_LONG:
+        print_long(dir, names, count);
+        break;
+    case MODE_HORIZONTAL:
+        print_horizontal(names, count, maxlen);
+        break;
+    default:
+        print_vertical(names, count, maxlen);
+        break;
+    }
+
+    free_entries(names, count);
+}
+
+/* Default display: columns, "down then across" */
+void print_vertical(char **names, size_t count, size_t maxlen)
+{
+    if (count == 0)
+        return;
+
+    size_t col_width = maxlen + 2;               /* name + 2 spaces */
+    size_t cols = (size_t)get_term_width() / col_width;
+    if (cols < 1) cols = 1;                      /* name wider than terminal */
+    if (cols > count) cols = count;
+    size_t rows = (count + cols - 1) / cols;     /* ceiling division */
+
+    for (size_t r = 0; r < rows; r++)
+    {
+        for (size_t c = 0; c < cols; c++)
+        {
+            size_t idx = r + c * rows;           /* down-then-across index */
+            if (idx >= count)
+                break;
+            if (idx + rows >= count)             /* last item in this row */
+                printf("%s", names[idx]);
+            else
+                printf("%-*s", (int)col_width, names[idx]);
+        }
+        putchar('\n');
+    }
+}
+
+/* -x display: left to right, wrap when the line is full */
+void print_horizontal(char **names, size_t count, size_t maxlen)
+{
+    if (count == 0)
+        return;
+
+    size_t col_width = maxlen + 2;
+    size_t term_width = (size_t)get_term_width();
+    size_t pos = 0;                              /* current horizontal position */
+
+    for (size_t i = 0; i < count; i++)
+    {
+        /* would this item go past the right edge? then start a new line */
+        if (pos > 0 && pos + col_width > term_width)
+        {
+            putchar('\n');
+            pos = 0;
+        }
+        printf("%-*s", (int)col_width, names[i]);
+        pos += col_width;
+    }
+    putchar('\n');
 }
 
 /* Number of digits needed to print n (used for column alignment) */
@@ -207,29 +273,18 @@ void mode_to_string(mode_t mode, char *str)
         str[9] = (mode & S_IXOTH) ? 't' : 'T';
 }
 
-void do_ls_long(const char *dir)
+/* -l display: works from the already-read array of names */
+void print_long(const char *dir, char **names, size_t count)
 {
-    DIR *dp = opendir(dir);
-    if (dp == NULL)
-    {
-        fprintf(stderr, "Cannot open directory : %s\n", dir);
-        return;
-    }
-
-    struct dirent *entry;
     struct stat st;
     char path[PATH_MAX];
     int w_links = 0, w_user = 0, w_group = 0, w_size = 0;
     long long total_blocks = 0;
 
     /* ---------- PASS 1: find column widths and the "total" ---------- */
-    errno = 0;
-    while ((entry = readdir(dp)) != NULL)
+    for (size_t i = 0; i < count; i++)
     {
-        if (entry->d_name[0] == '.')
-            continue;
-
-        snprintf(path, sizeof(path), "%s/%s", dir, entry->d_name);
+        snprintf(path, sizeof(path), "%s/%s", dir, names[i]);
         if (lstat(path, &st) == -1)
         {
             perror(path);
@@ -248,23 +303,15 @@ void do_ls_long(const char *dir)
 
         total_blocks += st.st_blocks; /* counted in 512-byte units */
     }
-    if (errno != 0)
-        perror("readdir failed");
 
     /* ls reports total in 1K blocks, st_blocks is in 512-byte units */
     printf("total %lld\n", total_blocks / 2);
 
-    /* Go back to the start of the directory for the second pass */
-    rewinddir(dp);
-
     /* ---------- PASS 2: print every entry ---------- */
     time_t now = time(NULL);
-    while ((entry = readdir(dp)) != NULL)
+    for (size_t i = 0; i < count; i++)
     {
-        if (entry->d_name[0] == '.')
-            continue;
-
-        snprintf(path, sizeof(path), "%s/%s", dir, entry->d_name);
+        snprintf(path, sizeof(path), "%s/%s", dir, names[i]);
         if (lstat(path, &st) == -1)
             continue;
 
@@ -297,7 +344,7 @@ void do_ls_long(const char *dir)
                w_group, gbuf,
                w_size, (long long)st.st_size,
                timebuf,
-               entry->d_name);
+               names[i]);
 
         /* For symbolic links, ls -l shows "name -> target" */
         if (S_ISLNK(st.st_mode))
@@ -312,6 +359,4 @@ void do_ls_long(const char *dir)
         }
         putchar('\n');
     }
-
-    closedir(dp);
 }
